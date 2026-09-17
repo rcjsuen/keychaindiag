@@ -16,12 +16,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/docker/secrets-engine/store"
 	"github.com/docker/secrets-engine/store/keychain"
+	"github.com/godbus/dbus/v5"
 )
 
 // diagServiceGroup and diagServiceName identify this probe's own throwaway
@@ -38,7 +41,9 @@ func main() {
 	fmt.Printf("%-25s %s\n", "GOOS:", runtime.GOOS)
 	printEnv("DBUS_SESSION_BUS_ADDRESS")
 	printEnv("XDG_RUNTIME_DIR")
+	printEnv("XDG_DATA_HOME")
 	fmt.Println()
+	printKeyringsDir()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -51,6 +56,8 @@ func main() {
 	}
 	fmt.Println("  OK: keychain.New succeeded")
 	fmt.Println()
+
+	dumpSecretServiceState()
 
 	fmt.Println("Probing for a sentinel key that is never written...")
 	probeID := store.MustParseID("keychaindiag/probe")
@@ -75,6 +82,133 @@ func printEnv(name string) {
 		return
 	}
 	fmt.Printf("%-25s (unset)\n", name+":")
+}
+
+// printKeyringsDir lists the on-disk keyring files GNOME Keyring would load
+// (names, sizes, permissions only -- never contents, which are encrypted
+// secret data). GNOME Keyring resolves this directory as $XDG_DATA_HOME/keyrings,
+// defaulting to ~/.local/share/keyrings when XDG_DATA_HOME is unset -- but
+// when XDG_DATA_HOME IS set to something else, ~/.local/share/keyrings can
+// still be the directory an earlier, differently-configured session actually
+// used. To not miss either, this checks both locations (skipping the second
+// if it's the same path as the first). Either being empty or missing is
+// itself a diagnostic signal on an SSH-only account that never completed a
+// real, PAM-driven login.
+func printKeyringsDir() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+
+	seen := make(map[string]bool)
+	check := func(base string) {
+		if base == "" || seen[base] {
+			return
+		}
+		seen[base] = true
+		printDirListing(filepath.Join(base, "keyrings"))
+	}
+
+	check(os.Getenv("XDG_DATA_HOME"))
+	if home, err := os.UserHomeDir(); err == nil {
+		check(filepath.Join(home, ".local", "share"))
+	} else {
+		fmt.Printf("could not resolve $HOME: %v\n\n", err)
+	}
+}
+
+// printDirListing prints one directory's entries (name, size, permissions
+// only -- never contents).
+func printDirListing(dir string) {
+	fmt.Printf("%s:\n", dir)
+	entries, err := os.ReadDir(dir)
+	switch {
+	case err != nil:
+		fmt.Printf("  %v\n", err)
+	case len(entries) == 0:
+		fmt.Println("  (empty)")
+	default:
+		for _, e := range entries {
+			info, err := e.Info()
+			if err != nil {
+				fmt.Printf("  %s\n", e.Name())
+				continue
+			}
+			fmt.Printf("  %-9s %8d bytes  %s\n", info.Mode(), info.Size(), e.Name())
+		}
+	}
+	fmt.Println()
+}
+
+const (
+	secretServiceDest  = "org.freedesktop.secrets"
+	secretServicePath  = dbus.ObjectPath("/org/freedesktop/secrets")
+	secretServiceIface = "org.freedesktop.Secret.Service"
+)
+
+// dumpSecretServiceState prints the Secret Service's own live view of its
+// collections and "default" alias, using the same two D-Bus calls
+// store/keychain makes internally (the Collections property and ReadAlias) --
+// see keychain.New's getDefaultCollection. It is strictly read-only: it never
+// creates, unlocks, or assigns anything.
+func dumpSecretServiceState() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	fmt.Println("Secret Service state (org.freedesktop.secrets over D-Bus):")
+
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		fmt.Printf("  could not connect to the session bus: %v\n\n", err)
+		return
+	}
+	obj := conn.Object(secretServiceDest, secretServicePath)
+
+	var collectionsVariant dbus.Variant
+	var collections []dbus.ObjectPath
+	if err := obj.Call("org.freedesktop.DBus.Properties.Get", 0, secretServiceIface, "Collections").Store(&collectionsVariant); err != nil {
+		fmt.Printf("  could not read the Collections property: %v\n", err)
+	} else if paths, ok := collectionsVariant.Value().([]dbus.ObjectPath); ok {
+		collections = paths
+		if len(paths) == 0 {
+			fmt.Println("  collections: (none)")
+		} else {
+			fmt.Println("  collections:")
+			for _, p := range paths {
+				fmt.Printf("    %s\n", p)
+			}
+		}
+	}
+
+	var defaultAlias dbus.ObjectPath
+	aliasErr := obj.Call(secretServiceIface+".ReadAlias", 0, "default").Store(&defaultAlias)
+	if aliasErr != nil {
+		fmt.Printf("  could not read the \"default\" alias: %v\n", aliasErr)
+	} else if defaultAlias == "" || defaultAlias == "/" {
+		fmt.Println(`  default alias: (not set)`)
+	} else {
+		fmt.Printf("  default alias: %s\n", defaultAlias)
+	}
+
+	// keychain.New resolves the collection to use the same way: it prefers a
+	// literal "login" collection over the "default" alias (see
+	// getDefaultCollection), so a missing alias does not necessarily mean
+	// nothing will resolve -- print the actual effective outcome rather than
+	// just the alias.
+	const loginCollection = dbus.ObjectPath("/org/freedesktop/secrets/collection/login")
+	var effective dbus.ObjectPath
+	switch {
+	case slices.Contains(collections, loginCollection):
+		effective = loginCollection
+	case aliasErr == nil && defaultAlias != "" && defaultAlias != "/":
+		effective = defaultAlias
+	}
+	if effective == "" {
+		fmt.Println("  effective default collection: NONE -- no \"login\" collection and no \"default\" alias")
+		fmt.Println("  this is what ErrNoDefaultCollection means.")
+	} else {
+		fmt.Printf("  effective default collection: %s\n", effective)
+	}
+	fmt.Println()
 }
 
 // report prints the raw failure plus a classification into the known,
